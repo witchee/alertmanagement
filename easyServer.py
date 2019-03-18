@@ -11,59 +11,62 @@ import cx_Oracle
 import os
 import time
 import threading
+import logging
+import logging.handlers
+
 
 # 解析grafana数据
 def analysis_grafana():
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(('127.0.0.1', 7000))
-        # s.bind(('127.0.0.1', 8000))
-        # s.bind(('192.168.20.1', 6666))
-        s.listen(10)
-    except socket.error as msg:
-        print(msg)
-        sys.exit(1)
-    print("Wait for Connection..................")
-    reload(sys)
-    sys.setdefaultencoding('utf8')
-    while True:
-        sock, addr = s.accept()
-        buf = sock.recv(4096)
-        buf = str(buf.decode('utf-8'))
-        sourcename = buf.split("\r\n")[2].split(" ")[1]
-        sourceid = search_source_id(sourcename)
-        alter = buf[buf.find("{"):]
-        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(str(now)+alter)
-        global null
-        null = ''
-        dic = eval(alter)
-        query = dic["evalMatches"]
-        alertname = dic["ruleName"]
-        alertname = str(alertname).replace("'", "")
-        messagearray = {}
-        for num in range(len(query)):
-            alertdetail = query[num]["metric"]
-            alertdetail = str(alertdetail).replace("'", "")
-            value = str(round(query[num]["value"], 2))
-            alertlogdetail = alertdetail + " " + value
-            save_alertlog(alertname, alertlogdetail, sourceid)
-            if "笔数" in alertname:
-                # 率和笔数需同时出现才发送报警
-                newalertdetail = alertdetail.replace("率", "").replace("笔数", "")
-                if alter.count(newalertdetail) > 1:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('127.0.0.1', 7000))
+            # s.bind(('127.0.0.1', 8000))
+            # s.bind(('192.168.20.1', 6666))
+            s.listen(10)
+        except socket.error as msg:
+            print(msg)
+            sys.exit(1)
+        reload(sys)
+        sys.setdefaultencoding('utf8')
+        while True:
+            sock, addr = s.accept()
+            buf = sock.recv(4096)
+            buf = str(buf.decode('utf-8'))
+            sourceid = search_source_id("Grafana")
+            alter = buf[buf.find("{"):]
+            log.info(alter)
+            global null
+            null = ''
+            dic = eval(alter)
+            query = dic["evalMatches"]
+            alertname = dic["ruleName"]
+            alertname = str(alertname).replace("'", "")
+            messagearray = {}
+            for num in range(len(query)):
+                alertdetail = query[num]["metric"]
+                alertdetail = str(alertdetail).replace("'", "")
+                value = str(round(query[num]["value"], 2))
+                alertlogdetail = alertdetail + " " + value
+                save_alertlog(alertname, alertlogdetail, sourceid)
+                if "笔数" in alertname:
+                    # 率和笔数需同时出现才发送报警
+                    newalertdetail = alertdetail.replace("率", "").replace("笔数", "")
+                    if alter.count(newalertdetail) > 1:
+                        messagearray = check_alert(sourceid, alertname, alertdetail, value, messagearray)
+                else:
                     messagearray = check_alert(sourceid, alertname, alertdetail, value, messagearray)
-            else:
-                messagearray = check_alert(sourceid, alertname, alertdetail, value, messagearray)
-            keys = list(messagearray.keys())
-            for key in keys:
-                # 字数大于500发送短信
-                if len(messagearray[key]) > 500:
-                    send_alert_message(key, messagearray[key])
-                    del messagearray[key]
-        for key in messagearray:
-            send_alert_message(key, messagearray[key])
+                keys = list(messagearray.keys())
+                for key in keys:
+                    # 字数大于500发送短信
+                    if len(messagearray[key]) > 500:
+                        send_alert_message(key, messagearray[key])
+                        del messagearray[key]
+            for key in messagearray:
+                send_alert_message(key, messagearray[key])
+    except:
+        send_error()
 
 
 # 判断报警
@@ -160,7 +163,8 @@ def send_alert_message(tel, message):
     url = 'http://163.10.10.185:10080/handapp_upmp/wl/SmsServlet?phoneNo=%s&sms=%s&code=utf-8'
     newurl = url % (tel, message)
     urllib.urlopen(newurl.encode('utf-8'))
-    print(newurl)
+    # print(newurl)
+    log.info(newurl)
 
 
 # 是否要重发
@@ -371,41 +375,44 @@ def get_recovery_time(sourceid, detail):
 
 # 发送恢复短信
 def send_recovery():
-    reload(sys)
-    sys.setdefaultencoding('utf8')
-    while True:
-        conn = connect_oracle()
-        c = conn.cursor()
-        x = c.execute("select ALERT_ID,LAST_ALERT_TIME,SOURCE_ID,ALERT_DETAIL from tb_alert where ALERT_STATUS=1")
-        rss = x.fetchall()
-        c.close()
-        conn.close()
-        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        nowtime = datetime.datetime.strptime(now, '%Y-%m-%d %H:%M:%S')
-        messagearray = {}
-        # 循环报警表中未恢复的报警
-        for rs in range(len(rss)):
-            last_alert_time = datetime.datetime.strptime(str(rss[rs][1]), '%Y-%m-%d %H:%M:%S')
-            timedifference = nowtime - last_alert_time
-            if "-1 day" in str(timedifference):
-                timedifference = datetime.datetime.strptime("00:00:00", '%H:%M:%S')
-            else:
-                timedifference = datetime.datetime.strptime(str(timedifference), '%H:%M:%S')
-            noalerttime = get_recovery_time(rss[rs][2], rss[rs][3])
-            if timedifference >= noalerttime:
-                update_alert_status(rss[rs][0])
-                message = get_alert_message(rss[rs][0])
-                message = message.replace("警告", "恢复")
-                tels = get_users(rss[rs][2], rss[rs][3])
-                for i in range(len(tels)):
-                    if str(tels[i]) in messagearray.keys():
-                        count = messagearray[str(tels[i])].count("报警名") + 1
-                        messagearray[str(tels[i])] += "\n" + "报警名" + str(count) + ":" + message
-                    else:
-                        messagearray[str(tels[i])] = "恢复提醒\n" + "时间:" + now + "\n" + "报警名1:" + message
-        for key in messagearray:
-            send_alert_message(key, messagearray[key])
-        time.sleep(10)
+    try:
+        reload(sys)
+        sys.setdefaultencoding('utf8')
+        while True:
+            conn = connect_oracle()
+            c = conn.cursor()
+            x = c.execute("select ALERT_ID,LAST_ALERT_TIME,SOURCE_ID,ALERT_DETAIL from tb_alert where ALERT_STATUS=1")
+            rss = x.fetchall()
+            c.close()
+            conn.close()
+            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            nowtime = datetime.datetime.strptime(now, '%Y-%m-%d %H:%M:%S')
+            messagearray = {}
+            # 循环报警表中未恢复的报警
+            for rs in range(len(rss)):
+                last_alert_time = datetime.datetime.strptime(str(rss[rs][1]), '%Y-%m-%d %H:%M:%S')
+                timedifference = nowtime - last_alert_time
+                if "-1 day" in str(timedifference):
+                    timedifference = datetime.datetime.strptime("00:00:00", '%H:%M:%S')
+                else:
+                    timedifference = datetime.datetime.strptime(str(timedifference), '%H:%M:%S')
+                noalerttime = get_recovery_time(rss[rs][2], rss[rs][3])
+                if timedifference >= noalerttime:
+                    update_alert_status(rss[rs][0])
+                    message = get_alert_message(rss[rs][0])
+                    message = message.replace("警告", "恢复")
+                    tels = get_users(rss[rs][2], rss[rs][3])
+                    for i in range(len(tels)):
+                        if str(tels[i]) in messagearray.keys():
+                            count = messagearray[str(tels[i])].count("报警名") + 1
+                            messagearray[str(tels[i])] += "\n" + "报警名" + str(count) + ":" + message
+                        else:
+                            messagearray[str(tels[i])] = "恢复提醒\n" + "时间:" + now + "\n" + "报警名1:" + message
+            for key in messagearray:
+                send_alert_message(key, messagearray[key])
+            time.sleep(10)
+    except:
+        send_error()
 
 
 # 获取报警信息
@@ -432,21 +439,29 @@ def update_alert_status(alert_id):
 
 # 循环维护表判断是否结束
 def change_maintenance():
-    while True:
-        conn = connect_oracle()
-        c = conn.cursor()
-        x = c.execute("select maintenance_id,maintenance_endtime from tb_maintenance")
-        rss = x.fetchall()
-        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
-        for rs in range(len(rss)):
-            id = rss[rs][0]
-            endtime = rss[rs][1]
-            if now >= endtime:
-                c.execute("update TB_MAINTENANCE set MAINTENANCE_STATUS=0 where MAINTENANCE_ID=" + str(id))
-                conn.commit()
-        c.close()
-        conn.close()
-        time.sleep(30)
+    try:
+        while True:
+            conn = connect_oracle()
+            c = conn.cursor()
+            x = c.execute("select maintenance_id,maintenance_endtime from tb_maintenance")
+            rss = x.fetchall()
+            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+            for rs in range(len(rss)):
+                id = rss[rs][0]
+                endtime = rss[rs][1]
+                if now >= endtime:
+                    c.execute("update TB_MAINTENANCE set MAINTENANCE_STATUS=0 where MAINTENANCE_ID=" + str(id))
+                    conn.commit()
+            c.close()
+            conn.close()
+            time.sleep(30)
+    except:
+        send_error()
+
+
+# 发送异常短信
+def send_error():
+    send_alert_message("13761337721", "程序异常")
 
 
 threads = []
@@ -459,9 +474,27 @@ threads.append(t3)
 
 
 if __name__ == '__main__':
+    log_dir = "logdir"
+    log_path = os.getcwd() + os.sep + log_dir
+    if not os.path.isdir(log_path):
+        os.makedirs(log_path)
+    # logging初始化工作
+    logging.basicConfig()
+    # log的初始化工作
+    log = logging.getLogger('log')
+    log.setLevel(logging.INFO)
+    # 添加TimedRotatingFileHandler
+    # 定义一个1天换一次log文件的handler
+    # 保留3个旧log文件
+    timefilehandler = logging.handlers.TimedRotatingFileHandler(log_dir + os.sep + "python.log", when='D', interval=1, backupCount=10)
+    # 设置后缀名称，跟strftime的格式一样
+    # timefilehandler.suffix = "%Y-%m-%d_%H-%M-%S.log"
+    timefilehandler.suffix = "%Y-%m-%d.log"
+    formatter = logging.Formatter('%(asctime)s   %(message)s')
+    timefilehandler.setFormatter(formatter)
+    log.addHandler(timefilehandler)
     for t in threads:
         t.setDaemon(True)
         t.start()
     t.join()
-
 
